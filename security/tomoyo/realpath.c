@@ -4,15 +4,8 @@
  * Copyright (C) 2005-2011  NTT DATA CORPORATION
  */
 
-#include <linux/types.h>
-#include <linux/mount.h>
-#include <linux/mnt_namespace.h>
-#include <linux/fs_struct.h>
-#include <linux/magic.h>
-#include <linux/slab.h>
-#include <net/sock.h>
 #include "common.h"
-#include "../../fs/internal.h"
+#include <linux/magic.h>
 
 /**
  * tomoyo_encode2 - Encode binary string to ascii string.
@@ -101,9 +94,8 @@ static char *tomoyo_get_absolute_path(struct path *path, char * const buffer,
 {
 	char *pos = ERR_PTR(-ENOMEM);
 	if (buflen >= 256) {
-		struct path ns_root = { };
 		/* go to whatever namespace root we are under */
-		pos = __d_path(path, &ns_root, buffer, buflen - 1);
+		pos = d_absolute_path(path, buffer, buflen - 1);
 		if (!IS_ERR(pos) && *pos == '/' && pos[1]) {
 			struct inode *inode = path->dentry->d_inode;
 			if (inode && S_ISDIR(inode->i_mode)) {
@@ -181,7 +173,7 @@ static char *tomoyo_get_local_path(struct dentry *dentry, char * const buffer,
 		 * Use filesystem name if filesystem does not support rename()
 		 * operation.
 		 */
-		if (inode->i_op && !inode->i_op->rename)
+		if (!inode->i_op->rename && !inode->i_op->rename2)
 			goto prepend_filesystem_name;
 	}
 	/* Prepend device name. */
@@ -290,12 +282,21 @@ char *tomoyo_realpath_from_path(struct path *path)
 		 * Get local name for filesystems without rename() operation
 		 * or dentry without vfsmount.
 		 */
-		if (!path->mnt || (inode->i_op && !inode->i_op->rename))
+		if (!path->mnt ||
+		    (!inode->i_op->rename && !inode->i_op->rename2))
 			pos = tomoyo_get_local_path(path->dentry, buf,
 						    buf_len - 1);
 		/* Get absolute name for the rest. */
-		else
+		else {
 			pos = tomoyo_get_absolute_path(path, buf, buf_len - 1);
+			/*
+			 * Fall back to local name if absolute name is not
+			 * available.
+			 */
+			if (pos == ERR_PTR(-EINVAL))
+				pos = tomoyo_get_local_path(path->dentry, buf,
+							    buf_len - 1);
+		}
 encode:
 		if (IS_ERR(pos))
 			continue;

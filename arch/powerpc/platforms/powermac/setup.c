@@ -57,7 +57,6 @@
 #include <asm/reg.h>
 #include <asm/sections.h>
 #include <asm/prom.h>
-#include <asm/system.h>
 #include <asm/pgtable.h>
 #include <asm/io.h>
 #include <asm/pci-bridge.h>
@@ -337,7 +336,7 @@ static void __init pmac_setup_arch(void)
 #endif
 
 #ifdef CONFIG_ADB
-	if (strstr(cmd_line, "adb_sync")) {
+	if (strstr(boot_command_line, "adb_sync")) {
 		extern int __adb_probe_sync;
 		__adb_probe_sync = 1;
 	}
@@ -461,7 +460,7 @@ pmac_halt(void)
 static void __init pmac_init_early(void)
 {
 	/* Enable early btext debug if requested */
-	if (strstr(cmd_line, "btextdbg")) {
+	if (strstr(boot_command_line, "btextdbg")) {
 		udbg_adb_init_early();
 		register_early_udbg_console();
 	}
@@ -470,8 +469,8 @@ static void __init pmac_init_early(void)
 	pmac_feature_init();
 
 	/* Initialize debug stuff */
-	udbg_scc_init(!!strstr(cmd_line, "sccdbg"));
-	udbg_adb_init(!!strstr(cmd_line, "btextdbg"));
+	udbg_scc_init(!!strstr(boot_command_line, "sccdbg"));
+	udbg_adb_init(!!strstr(boot_command_line, "btextdbg"));
 
 #ifdef CONFIG_PPC64
 	iommu_init_early_dart();
@@ -494,11 +493,15 @@ static int __init pmac_declare_of_platform_devices(void)
 		return -1;
 
 	np = of_find_node_by_name(NULL, "valkyrie");
-	if (np)
+	if (np) {
 		of_platform_device_create(np, "valkyrie", NULL);
+		of_node_put(np);
+	}
 	np = of_find_node_by_name(NULL, "platinum");
-	if (np)
+	if (np) {
 		of_platform_device_create(np, "platinum", NULL);
+		of_node_put(np);
+	}
         np = of_find_node_by_type(NULL, "smu");
         if (np) {
 		of_platform_device_create(np, "smu", NULL);

@@ -1,6 +1,6 @@
 /*
  * QLogic iSCSI HBA Driver
- * Copyright (c)  2003-2010 QLogic Corporation
+ * Copyright (c)  2003-2013 QLogic Corporation
  *
  * See LICENSE.qla4xxx for copyright and licensing details.
  */
@@ -86,6 +86,7 @@ static void qla4xxx_init_response_q_entries(struct scsi_qla_host *ha)
 int qla4xxx_init_rings(struct scsi_qla_host *ha)
 {
 	unsigned long flags = 0;
+	int i;
 
 	/* Initialize request queue. */
 	spin_lock_irqsave(&ha->hardware_lock, flags);
@@ -101,11 +102,18 @@ int qla4xxx_init_rings(struct scsi_qla_host *ha)
 
 	if (is_qla8022(ha)) {
 		writel(0,
-		    (unsigned long  __iomem *)&ha->qla4_8xxx_reg->req_q_out);
+		    (unsigned long  __iomem *)&ha->qla4_82xx_reg->req_q_out);
 		writel(0,
-		    (unsigned long  __iomem *)&ha->qla4_8xxx_reg->rsp_q_in);
+		    (unsigned long  __iomem *)&ha->qla4_82xx_reg->rsp_q_in);
 		writel(0,
-		    (unsigned long  __iomem *)&ha->qla4_8xxx_reg->rsp_q_out);
+		    (unsigned long  __iomem *)&ha->qla4_82xx_reg->rsp_q_out);
+	} else if (is_qla8032(ha) || is_qla8042(ha)) {
+		writel(0,
+		       (unsigned long __iomem *)&ha->qla4_83xx_reg->req_q_in);
+		writel(0,
+		       (unsigned long __iomem *)&ha->qla4_83xx_reg->rsp_q_in);
+		writel(0,
+		       (unsigned long __iomem *)&ha->qla4_83xx_reg->rsp_q_out);
 	} else {
 		/*
 		 * Initialize DMA Shadow registers.  The firmware is really
@@ -124,6 +132,10 @@ int qla4xxx_init_rings(struct scsi_qla_host *ha)
 	}
 
 	qla4xxx_init_response_q_entries(ha);
+
+	/* Initialize mailbox active array */
+	for (i = 0; i < MAX_MRB; i++)
+		ha->active_mrb_array[i] = NULL;
 
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
@@ -183,12 +195,10 @@ exit_get_sys_info_no_free:
  * @ha: pointer to host adapter structure.
  *
  **/
-static int qla4xxx_init_local_data(struct scsi_qla_host *ha)
+static void qla4xxx_init_local_data(struct scsi_qla_host *ha)
 {
 	/* Initialize aen queue */
 	ha->aen_q_count = MAX_AEN_ENTRIES;
-
-	return qla4xxx_get_firmware_status(ha);
 }
 
 static uint8_t
@@ -270,6 +280,126 @@ qla4xxx_wait_for_ip_config(struct scsi_qla_host *ha)
 	}
 
 	return ipv4_wait|ipv6_wait;
+}
+
+static int qla4_80xx_is_minidump_dma_capable(struct scsi_qla_host *ha,
+		struct qla4_8xxx_minidump_template_hdr *md_hdr)
+{
+	int offset = (is_qla8022(ha)) ? QLA8022_TEMPLATE_CAP_OFFSET :
+					QLA83XX_TEMPLATE_CAP_OFFSET;
+	int rval = 1;
+	uint32_t *cap_offset;
+
+	cap_offset = (uint32_t *)((char *)md_hdr + offset);
+
+	if (!(le32_to_cpu(*cap_offset) & BIT_0)) {
+		ql4_printk(KERN_INFO, ha, "PEX DMA Not supported %d\n",
+			   *cap_offset);
+		rval = 0;
+	}
+
+	return rval;
+}
+
+/**
+ * qla4xxx_alloc_fw_dump - Allocate memory for minidump data.
+ * @ha: pointer to host adapter structure.
+ **/
+void qla4xxx_alloc_fw_dump(struct scsi_qla_host *ha)
+{
+	int status;
+	uint32_t capture_debug_level;
+	int hdr_entry_bit, k;
+	void *md_tmp;
+	dma_addr_t md_tmp_dma;
+	struct qla4_8xxx_minidump_template_hdr *md_hdr;
+	int dma_capable;
+
+	if (ha->fw_dump) {
+		ql4_printk(KERN_WARNING, ha,
+			   "Firmware dump previously allocated.\n");
+		return;
+	}
+
+	status = qla4xxx_req_template_size(ha);
+	if (status != QLA_SUCCESS) {
+		ql4_printk(KERN_INFO, ha,
+			   "scsi%ld: Failed to get template size\n",
+			   ha->host_no);
+		return;
+	}
+
+	clear_bit(AF_82XX_FW_DUMPED, &ha->flags);
+
+	/* Allocate memory for saving the template */
+	md_tmp = dma_alloc_coherent(&ha->pdev->dev, ha->fw_dump_tmplt_size,
+				    &md_tmp_dma, GFP_KERNEL);
+	if (!md_tmp) {
+		ql4_printk(KERN_INFO, ha,
+			   "scsi%ld: Failed to allocate DMA memory\n",
+			   ha->host_no);
+		return;
+	}
+
+	/* Request template */
+	status =  qla4xxx_get_minidump_template(ha, md_tmp_dma);
+	if (status != QLA_SUCCESS) {
+		ql4_printk(KERN_INFO, ha,
+			   "scsi%ld: Failed to get minidump template\n",
+			   ha->host_no);
+		goto alloc_cleanup;
+	}
+
+	md_hdr = (struct qla4_8xxx_minidump_template_hdr *)md_tmp;
+
+	dma_capable = qla4_80xx_is_minidump_dma_capable(ha, md_hdr);
+
+	capture_debug_level = md_hdr->capture_debug_level;
+
+	/* Get capture mask based on module loadtime setting. */
+	if ((ql4xmdcapmask >= 0x3 && ql4xmdcapmask <= 0x7F) ||
+	    (ql4xmdcapmask == 0xFF && dma_capable))  {
+		ha->fw_dump_capture_mask = ql4xmdcapmask;
+	} else {
+		if (ql4xmdcapmask == 0xFF)
+			ql4_printk(KERN_INFO, ha, "Falling back to default capture mask, as PEX DMA is not supported\n");
+		ha->fw_dump_capture_mask = capture_debug_level;
+	}
+
+	md_hdr->driver_capture_mask = ha->fw_dump_capture_mask;
+
+	DEBUG2(ql4_printk(KERN_INFO, ha, "Minimum num of entries = %d\n",
+			  md_hdr->num_of_entries));
+	DEBUG2(ql4_printk(KERN_INFO, ha, "Dump template size  = %d\n",
+			  ha->fw_dump_tmplt_size));
+	DEBUG2(ql4_printk(KERN_INFO, ha, "Selected Capture mask =0x%x\n",
+			  ha->fw_dump_capture_mask));
+
+	/* Calculate fw_dump_size */
+	for (hdr_entry_bit = 0x2, k = 1; (hdr_entry_bit & 0xFF);
+	     hdr_entry_bit <<= 1, k++) {
+		if (hdr_entry_bit & ha->fw_dump_capture_mask)
+			ha->fw_dump_size += md_hdr->capture_size_array[k];
+	}
+
+	/* Total firmware dump size including command header */
+	ha->fw_dump_size += ha->fw_dump_tmplt_size;
+	ha->fw_dump = vmalloc(ha->fw_dump_size);
+	if (!ha->fw_dump)
+		goto alloc_cleanup;
+
+	DEBUG2(ql4_printk(KERN_INFO, ha,
+			  "Minidump Tempalate Size = 0x%x KB\n",
+			  ha->fw_dump_tmplt_size));
+	DEBUG2(ql4_printk(KERN_INFO, ha,
+			  "Total Minidump size = 0x%x KB\n", ha->fw_dump_size));
+
+	memcpy(ha->fw_dump, md_tmp, ha->fw_dump_tmplt_size);
+	ha->fw_dump_tmplt_hdr = ha->fw_dump;
+
+alloc_cleanup:
+	dma_free_coherent(&ha->pdev->dev, ha->fw_dump_tmplt_size,
+			  md_tmp, md_tmp_dma);
 }
 
 static int qla4xxx_fw_ready(struct scsi_qla_host *ha)
@@ -431,7 +561,7 @@ static int qla4xxx_init_firmware(struct scsi_qla_host *ha)
 	/* For 82xx, stop firmware before initializing because if BIOS
 	 * has previously initialized firmware, then driver's initialize
 	 * firmware will fail. */
-	if (is_qla8022(ha))
+	if (is_qla80XX(ha))
 		qla4_8xxx_stop_firmware(ha);
 
 	ql4_printk(KERN_INFO, ha, "Initializing firmware..\n");
@@ -440,8 +570,12 @@ static int qla4xxx_init_firmware(struct scsi_qla_host *ha)
 			      "control block\n", ha->host_no, __func__));
 		return status;
 	}
+
 	if (!qla4xxx_fw_ready(ha))
 		return status;
+
+	if (is_qla80XX(ha) && !test_bit(AF_INIT_DONE, &ha->flags))
+		qla4xxx_alloc_fw_dump(ha);
 
 	return qla4xxx_get_firmware_status(ha);
 }
@@ -697,6 +831,9 @@ int qla4xxx_start_firmware(struct scsi_qla_host *ha)
 			writel(set_rmask(CSR_SCSI_PROCESSOR_INTR),
 			       &ha->reg->ctrl_status);
 			readl(&ha->reg->ctrl_status);
+			writel(set_rmask(CSR_SCSI_COMPLETION_INTR),
+			       &ha->reg->ctrl_status);
+			readl(&ha->reg->ctrl_status);
 			spin_unlock_irqrestore(&ha->hardware_lock, flags);
 			if (qla4xxx_get_firmware_state(ha) == QLA_SUCCESS) {
 				DEBUG2(printk("scsi%ld: %s: Get firmware "
@@ -759,6 +896,8 @@ int qla4xxx_start_firmware(struct scsi_qla_host *ha)
 	if (status == QLA_SUCCESS) {
 		if (test_and_clear_bit(AF_GET_CRASH_RECORD, &ha->flags))
 			qla4xxx_get_crash_record(ha);
+
+		qla4xxx_init_rings(ha);
 	} else {
 		DEBUG(printk("scsi%ld: %s: Firmware has NOT started\n",
 			     ha->host_no, __func__));
@@ -773,22 +912,24 @@ int qla4xxx_start_firmware(struct scsi_qla_host *ha)
  * be freed so that when login happens from user space there are free DDB
  * indices available.
  **/
-static void qla4xxx_free_ddb_index(struct scsi_qla_host *ha)
+void qla4xxx_free_ddb_index(struct scsi_qla_host *ha)
 {
 	int max_ddbs;
 	int ret;
 	uint32_t idx = 0, next_idx = 0;
 	uint32_t state = 0, conn_err = 0;
 
-	max_ddbs =  is_qla40XX(ha) ? MAX_PRST_DEV_DB_ENTRIES :
+	max_ddbs =  is_qla40XX(ha) ? MAX_DEV_DB_ENTRIES_40XX :
 				     MAX_DEV_DB_ENTRIES;
 
 	for (idx = 0; idx < max_ddbs; idx = next_idx) {
 		ret = qla4xxx_get_fwddb_entry(ha, idx, NULL, 0, NULL,
 					      &next_idx, &state, &conn_err,
 						NULL, NULL);
-		if (ret == QLA_ERROR)
+		if (ret == QLA_ERROR) {
+			next_idx++;
 			continue;
+		}
 		if (state == DDB_DS_NO_CONNECTION_ACTIVE ||
 		    state == DDB_DS_SESSION_FAILED) {
 			DEBUG2(ql4_printk(KERN_INFO, ha,
@@ -804,7 +945,6 @@ static void qla4xxx_free_ddb_index(struct scsi_qla_host *ha)
 	}
 }
 
-
 /**
  * qla4xxx_initialize_adapter - initiailizes hba
  * @ha: Pointer to host adapter structure.
@@ -812,7 +952,7 @@ static void qla4xxx_free_ddb_index(struct scsi_qla_host *ha)
  * This routine parforms all of the steps necessary to initialize the adapter.
  *
  **/
-int qla4xxx_initialize_adapter(struct scsi_qla_host *ha)
+int qla4xxx_initialize_adapter(struct scsi_qla_host *ha, int is_reset)
 {
 	int status = QLA_ERROR;
 
@@ -827,65 +967,44 @@ int qla4xxx_initialize_adapter(struct scsi_qla_host *ha)
 	if (ha->isp_ops->start_firmware(ha) == QLA_ERROR)
 		goto exit_init_hba;
 
+	/*
+	 * For ISP83XX, mailbox and IOCB interrupts are enabled separately.
+	 * Mailbox interrupts must be enabled prior to issuing any mailbox
+	 * command in order to prevent the possibility of losing interrupts
+	 * while switching from polling to interrupt mode. IOCB interrupts are
+	 * enabled via isp_ops->enable_intrs.
+	 */
+	if (is_qla8032(ha) || is_qla8042(ha))
+		qla4_83xx_enable_mbox_intrs(ha);
+
 	if (qla4xxx_about_firmware(ha) == QLA_ERROR)
 		goto exit_init_hba;
 
 	if (ha->isp_ops->get_sys_info(ha) == QLA_ERROR)
 		goto exit_init_hba;
 
-	if (qla4xxx_init_local_data(ha) == QLA_ERROR)
-		goto exit_init_hba;
+	qla4xxx_init_local_data(ha);
 
 	status = qla4xxx_init_firmware(ha);
 	if (status == QLA_ERROR)
 		goto exit_init_hba;
 
-	qla4xxx_free_ddb_index(ha);
+	if (is_reset == RESET_ADAPTER)
+		qla4xxx_build_ddb_list(ha, is_reset);
 
 	set_bit(AF_ONLINE, &ha->flags);
-exit_init_hba:
-	if (is_qla8022(ha) && (status == QLA_ERROR)) {
-		/* Since interrupts are registered in start_firmware for
-		 * 82xx, release them here if initialize_adapter fails */
-		qla4xxx_free_irqs(ha);
-	}
 
+exit_init_hba:
 	DEBUG2(printk("scsi%ld: initialize adapter: %s\n", ha->host_no,
 	    status == QLA_ERROR ? "FAILED" : "SUCCEEDED"));
 	return status;
 }
 
-/**
- * qla4xxx_process_ddb_changed - process ddb state change
- * @ha - Pointer to host adapter structure.
- * @fw_ddb_index - Firmware's device database index
- * @state - Device state
- *
- * This routine processes a Decive Database Changed AEN Event.
- **/
-int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
-		uint32_t state, uint32_t conn_err)
+int qla4xxx_ddb_change(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
+		       struct ddb_entry *ddb_entry, uint32_t state)
 {
-	struct ddb_entry * ddb_entry;
 	uint32_t old_fw_ddb_device_state;
 	int status = QLA_ERROR;
-
-	/* check for out of range index */
-	if (fw_ddb_index >= MAX_DDB_ENTRIES)
-		goto exit_ddb_event;
-
-	/* Get the corresponging ddb entry */
-	ddb_entry = qla4xxx_lookup_ddb_by_fw_index(ha, fw_ddb_index);
-	/* Device does not currently exist in our database. */
-	if (ddb_entry == NULL) {
-		ql4_printk(KERN_ERR, ha, "%s: No ddb_entry at FW index [%d]\n",
-			   __func__, fw_ddb_index);
-
-		if (state == DDB_DS_NO_CONNECTION_ACTIVE)
-			clear_bit(fw_ddb_index, ha->ddb_idx_map);
-
-		goto exit_ddb_event;
-	}
 
 	old_fw_ddb_device_state = ddb_entry->fw_ddb_device_state;
 	DEBUG2(ql4_printk(KERN_INFO, ha,
@@ -900,10 +1019,8 @@ int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
 		switch (state) {
 		case DDB_DS_SESSION_ACTIVE:
 		case DDB_DS_DISCOVERY:
-			iscsi_conn_start(ddb_entry->conn);
-			iscsi_conn_login_event(ddb_entry->conn,
-					       ISCSI_CONN_STATE_LOGGED_IN);
 			qla4xxx_update_session_conn_param(ha, ddb_entry);
+			ddb_entry->unblock_sess(ddb_entry->sess);
 			status = QLA_SUCCESS;
 			break;
 		case DDB_DS_SESSION_FAILED:
@@ -915,6 +1032,7 @@ int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
 		}
 		break;
 	case DDB_DS_SESSION_ACTIVE:
+	case DDB_DS_DISCOVERY:
 		switch (state) {
 		case DDB_DS_SESSION_FAILED:
 			/*
@@ -936,9 +1054,7 @@ int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
 		switch (state) {
 		case DDB_DS_SESSION_ACTIVE:
 		case DDB_DS_DISCOVERY:
-			iscsi_conn_start(ddb_entry->conn);
-			iscsi_conn_login_event(ddb_entry->conn,
-					       ISCSI_CONN_STATE_LOGGED_IN);
+			ddb_entry->unblock_sess(ddb_entry->sess);
 			qla4xxx_update_session_conn_param(ha, ddb_entry);
 			status = QLA_SUCCESS;
 			break;
@@ -954,7 +1070,198 @@ int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
 				__func__));
 		break;
 	}
+	return status;
+}
+
+void qla4xxx_arm_relogin_timer(struct ddb_entry *ddb_entry)
+{
+	/*
+	 * This triggers a relogin.  After the relogin_timer
+	 * expires, the relogin gets scheduled.  We must wait a
+	 * minimum amount of time since receiving an 0x8014 AEN
+	 * with failed device_state or a logout response before
+	 * we can issue another relogin.
+	 *
+	 * Firmware pads this timeout: (time2wait +1).
+	 * Driver retry to login should be longer than F/W.
+	 * Otherwise F/W will fail
+	 * set_ddb() mbx cmd with 0x4005 since it still
+	 * counting down its time2wait.
+	 */
+	atomic_set(&ddb_entry->relogin_timer, 0);
+	atomic_set(&ddb_entry->retry_relogin_timer,
+		   ddb_entry->default_time2wait + 4);
+
+}
+
+int qla4xxx_flash_ddb_change(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
+			     struct ddb_entry *ddb_entry, uint32_t state)
+{
+	uint32_t old_fw_ddb_device_state;
+	int status = QLA_ERROR;
+
+	old_fw_ddb_device_state = ddb_entry->fw_ddb_device_state;
+	DEBUG2(ql4_printk(KERN_INFO, ha,
+			  "%s: DDB - old state = 0x%x, new state = 0x%x for "
+			  "index [%d]\n", __func__,
+			  ddb_entry->fw_ddb_device_state, state, fw_ddb_index));
+
+	ddb_entry->fw_ddb_device_state = state;
+
+	switch (old_fw_ddb_device_state) {
+	case DDB_DS_LOGIN_IN_PROCESS:
+	case DDB_DS_NO_CONNECTION_ACTIVE:
+		switch (state) {
+		case DDB_DS_SESSION_ACTIVE:
+			ddb_entry->unblock_sess(ddb_entry->sess);
+			qla4xxx_update_session_conn_fwddb_param(ha, ddb_entry);
+			status = QLA_SUCCESS;
+			break;
+		case DDB_DS_SESSION_FAILED:
+			iscsi_block_session(ddb_entry->sess);
+			if (!test_bit(DF_RELOGIN, &ddb_entry->flags))
+				qla4xxx_arm_relogin_timer(ddb_entry);
+			status = QLA_SUCCESS;
+			break;
+		}
+		break;
+	case DDB_DS_SESSION_ACTIVE:
+		switch (state) {
+		case DDB_DS_SESSION_FAILED:
+			iscsi_block_session(ddb_entry->sess);
+			if (!test_bit(DF_RELOGIN, &ddb_entry->flags))
+				qla4xxx_arm_relogin_timer(ddb_entry);
+			status = QLA_SUCCESS;
+			break;
+		}
+		break;
+	case DDB_DS_SESSION_FAILED:
+		switch (state) {
+		case DDB_DS_SESSION_ACTIVE:
+			ddb_entry->unblock_sess(ddb_entry->sess);
+			qla4xxx_update_session_conn_fwddb_param(ha, ddb_entry);
+			status = QLA_SUCCESS;
+			break;
+		case DDB_DS_SESSION_FAILED:
+			if (!test_bit(DF_RELOGIN, &ddb_entry->flags))
+				qla4xxx_arm_relogin_timer(ddb_entry);
+			status = QLA_SUCCESS;
+			break;
+		}
+		break;
+	default:
+		DEBUG2(ql4_printk(KERN_INFO, ha, "%s: Unknown Event\n",
+				  __func__));
+		break;
+	}
+	return status;
+}
+
+/**
+ * qla4xxx_process_ddb_changed - process ddb state change
+ * @ha - Pointer to host adapter structure.
+ * @fw_ddb_index - Firmware's device database index
+ * @state - Device state
+ *
+ * This routine processes a Decive Database Changed AEN Event.
+ **/
+int qla4xxx_process_ddb_changed(struct scsi_qla_host *ha,
+				uint32_t fw_ddb_index,
+				uint32_t state, uint32_t conn_err)
+{
+	struct ddb_entry *ddb_entry;
+	int status = QLA_ERROR;
+
+	/* check for out of range index */
+	if (fw_ddb_index >= MAX_DDB_ENTRIES)
+		goto exit_ddb_event;
+
+	/* Get the corresponging ddb entry */
+	ddb_entry = qla4xxx_lookup_ddb_by_fw_index(ha, fw_ddb_index);
+	/* Device does not currently exist in our database. */
+	if (ddb_entry == NULL) {
+		ql4_printk(KERN_ERR, ha, "%s: No ddb_entry at FW index [%d]\n",
+			   __func__, fw_ddb_index);
+
+		if (state == DDB_DS_NO_CONNECTION_ACTIVE)
+			clear_bit(fw_ddb_index, ha->ddb_idx_map);
+
+		goto exit_ddb_event;
+	}
+
+	ddb_entry->ddb_change(ha, fw_ddb_index, ddb_entry, state);
 
 exit_ddb_event:
 	return status;
 }
+
+/**
+ * qla4xxx_login_flash_ddb - Login to target (DDB)
+ * @cls_session: Pointer to the session to login
+ *
+ * This routine logins to the target.
+ * Issues setddb and conn open mbx
+ **/
+void qla4xxx_login_flash_ddb(struct iscsi_cls_session *cls_session)
+{
+	struct iscsi_session *sess;
+	struct ddb_entry *ddb_entry;
+	struct scsi_qla_host *ha;
+	struct dev_db_entry *fw_ddb_entry = NULL;
+	dma_addr_t fw_ddb_dma;
+	uint32_t mbx_sts = 0;
+	int ret;
+
+	sess = cls_session->dd_data;
+	ddb_entry = sess->dd_data;
+	ha =  ddb_entry->ha;
+
+	if (!test_bit(AF_LINK_UP, &ha->flags))
+		return;
+
+	if (ddb_entry->ddb_type != FLASH_DDB) {
+		DEBUG2(ql4_printk(KERN_INFO, ha,
+				  "Skipping login to non FLASH DB"));
+		goto exit_login;
+	}
+
+	fw_ddb_entry = dma_pool_alloc(ha->fw_ddb_dma_pool, GFP_KERNEL,
+				      &fw_ddb_dma);
+	if (fw_ddb_entry == NULL) {
+		DEBUG2(ql4_printk(KERN_ERR, ha, "Out of memory\n"));
+		goto exit_login;
+	}
+
+	if (ddb_entry->fw_ddb_index == INVALID_ENTRY) {
+		ret = qla4xxx_get_ddb_index(ha, &ddb_entry->fw_ddb_index);
+		if (ret == QLA_ERROR)
+			goto exit_login;
+
+		ha->fw_ddb_index_map[ddb_entry->fw_ddb_index] = ddb_entry;
+		ha->tot_ddbs++;
+	}
+
+	memcpy(fw_ddb_entry, &ddb_entry->fw_ddb_entry,
+	       sizeof(struct dev_db_entry));
+	ddb_entry->sess->target_id = ddb_entry->fw_ddb_index;
+
+	ret = qla4xxx_set_ddb_entry(ha, ddb_entry->fw_ddb_index,
+				    fw_ddb_dma, &mbx_sts);
+	if (ret == QLA_ERROR) {
+		DEBUG2(ql4_printk(KERN_ERR, ha, "Set DDB failed\n"));
+		goto exit_login;
+	}
+
+	ddb_entry->fw_ddb_device_state = DDB_DS_LOGIN_IN_PROCESS;
+	ret = qla4xxx_conn_open(ha, ddb_entry->fw_ddb_index);
+	if (ret == QLA_ERROR) {
+		ql4_printk(KERN_ERR, ha, "%s: Login failed: %s\n", __func__,
+			   sess->targetname);
+		goto exit_login;
+	}
+
+exit_login:
+	if (fw_ddb_entry)
+		dma_pool_free(ha->fw_ddb_dma_pool, fw_ddb_entry, fw_ddb_dma);
+}
+

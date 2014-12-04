@@ -119,6 +119,7 @@ struct s3c_plltab {
 struct s3c_cpufreq_config {
 	struct s3c_freq		freq;
 	struct s3c_freq		max;
+	struct clk		*mpll;
 	struct cpufreq_frequency_table pll;
 	struct s3c_clkdivs	divs;
 	struct s3c_cpufreq_info *info;	/* for core, not drivers */
@@ -139,7 +140,6 @@ struct s3c_cpufreq_config {
  *	any frequency changes. This is really only need by devices like the
  *	S3C2410 where there is no or limited divider between the PLL and the
  *	ARMCLK.
- * @resume_clocks: Update the clocks on resume.
  * @get_iotiming: Get the current IO timing data, mainly for use at start.
  * @set_iotiming: Update the IO timings from the cached copies calculated
  *	from the @calc_iotiming entry when changing the frequency.
@@ -167,8 +167,6 @@ struct s3c_cpufreq_info {
 	unsigned int		need_pll:1;
 
 	/* driver routines */
-
-	void		(*resume_clocks)(void);
 
 	int		(*get_iotiming)(struct s3c_cpufreq_config *cfg,
 					struct s3c_iotimings *timings);
@@ -202,15 +200,7 @@ extern int s3c_plltab_register(struct cpufreq_frequency_table *plls,
 extern struct s3c_cpufreq_config *s3c_cpufreq_getconfig(void);
 extern struct s3c_iotimings *s3c_cpufreq_getiotimings(void);
 
-extern void s3c2410_iotiming_debugfs(struct seq_file *seq,
-				     struct s3c_cpufreq_config *cfg,
-				     union s3c_iobank *iob);
-
-extern void s3c2412_iotiming_debugfs(struct seq_file *seq,
-				     struct s3c_cpufreq_config *cfg,
-				     union s3c_iobank *iob);
-
-#ifdef CONFIG_CPU_FREQ_S3C24XX_DEBUGFS
+#ifdef CONFIG_ARM_S3C24XX_CPUFREQ_DEBUGFS
 #define s3c_cpufreq_debugfs_call(x) x
 #else
 #define s3c_cpufreq_debugfs_call(x) NULL
@@ -226,6 +216,10 @@ extern void s3c2410_cpufreq_setrefresh(struct s3c_cpufreq_config *cfg);
 extern void s3c2410_set_fvco(struct s3c_cpufreq_config *cfg);
 
 #ifdef CONFIG_S3C2410_IOTIMING
+extern void s3c2410_iotiming_debugfs(struct seq_file *seq,
+				     struct s3c_cpufreq_config *cfg,
+				     union s3c_iobank *iob);
+
 extern int s3c2410_iotiming_calc(struct s3c_cpufreq_config *cfg,
 				 struct s3c_iotimings *iot);
 
@@ -235,6 +229,7 @@ extern int s3c2410_iotiming_get(struct s3c_cpufreq_config *cfg,
 extern void s3c2410_iotiming_set(struct s3c_cpufreq_config *cfg,
 				 struct s3c_iotimings *iot);
 #else
+#define s3c2410_iotiming_debugfs NULL
 #define s3c2410_iotiming_calc NULL
 #define s3c2410_iotiming_get NULL
 #define s3c2410_iotiming_set NULL
@@ -242,8 +237,10 @@ extern void s3c2410_iotiming_set(struct s3c_cpufreq_config *cfg,
 
 /* S3C2412 compatible routines */
 
-extern int s3c2412_iotiming_get(struct s3c_cpufreq_config *cfg,
-				struct s3c_iotimings *timings);
+#ifdef CONFIG_S3C2412_IOTIMING
+extern void s3c2412_iotiming_debugfs(struct seq_file *seq,
+				     struct s3c_cpufreq_config *cfg,
+				     union s3c_iobank *iob);
 
 extern int s3c2412_iotiming_get(struct s3c_cpufreq_config *cfg,
 				struct s3c_iotimings *timings);
@@ -253,18 +250,24 @@ extern int s3c2412_iotiming_calc(struct s3c_cpufreq_config *cfg,
 
 extern void s3c2412_iotiming_set(struct s3c_cpufreq_config *cfg,
 				 struct s3c_iotimings *iot);
+#else
+#define s3c2412_iotiming_debugfs NULL
+#define s3c2412_iotiming_calc NULL
+#define s3c2412_iotiming_get NULL
+#define s3c2412_iotiming_set NULL
+#endif /* CONFIG_S3C2412_IOTIMING */
 
-#ifdef CONFIG_CPU_FREQ_S3C24XX_DEBUG
+#ifdef CONFIG_ARM_S3C24XX_CPUFREQ_DEBUG
 #define s3c_freq_dbg(x...) printk(KERN_INFO x)
 #else
 #define s3c_freq_dbg(x...) do { if (0) printk(x); } while (0)
-#endif /* CONFIG_CPU_FREQ_S3C24XX_DEBUG */
+#endif /* CONFIG_ARM_S3C24XX_CPUFREQ_DEBUG */
 
-#ifdef CONFIG_CPU_FREQ_S3C24XX_IODEBUG
+#ifdef CONFIG_ARM_S3C24XX_CPUFREQ_IODEBUG
 #define s3c_freq_iodbg(x...) printk(KERN_INFO x)
 #else
 #define s3c_freq_iodbg(x...) do { if (0) printk(x); } while (0)
-#endif /* CONFIG_CPU_FREQ_S3C24XX_IODEBUG */
+#endif /* CONFIG_ARM_S3C24XX_CPUFREQ_IODEBUG */
 
 static inline int s3c_cpufreq_addfreq(struct cpufreq_frequency_table *table,
 				      int index, size_t table_size,
@@ -280,7 +283,7 @@ static inline int s3c_cpufreq_addfreq(struct cpufreq_frequency_table *table,
 		s3c_freq_dbg("%s: { %d = %u kHz }\n",
 			     __func__, index, freq);
 
-		table[index].index = index;
+		table[index].driver_data = index;
 		table[index].frequency = freq;
 	}
 
